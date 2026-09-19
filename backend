@@ -1,0 +1,248 @@
+/**
+ * Classeur AMD International — backend de synchronisation Google Sheets v2
+ *
+ * NOUVEAUTÉS vs v1 :
+ * - Chaque dossier = une ligne (au lieu d'un seul blob JSON en A1)
+ *   -> lisible et filtrable directement dans Google Sheets
+ * - CRUD complet : add / update / delete / list / get / stats
+ * - Onglet "Historique" : trace chaque création/modification/suppression
+ * - Rappels automatiques par email quand une échéance approche
+ * - bulkSync : pour resynchroniser tout depuis l'artefact en un coup
+ *
+ * INSTALLATION :
+ * 1. Crée un Google Sheet vide (n'importe quel nom).
+ * 2. Menu Extensions > Apps Script.
+ * 3. Supprime le contenu par défaut et colle tout ce fichier.
+ * 4. Menu Project Settings (roue crantée à gauche) > Script Properties
+ *    > Add script property : clé = CLASSEUR_TOKEN, valeur = un mot de passe
+ *    que tu choisis (garde-le, c'est lui qui protège tes données).
+ * 5. Menu Deploy > New deployment > type "Web app".
+ *    - Execute as: Me
+ *    - Who has access: Anyone
+ * 6. Copie l'URL générée (se termine par /exec).
+ * 7. (Optionnel) Menu Triggers (horloge à gauche) > Add Trigger >
+ *    fonction "verifierEcheances" > Time-driven > Day timer
+ *    -> pour recevoir un email quand une échéance approche à 3 jours.
+ *
+ * APPELS DEPUIS L'ARTEFACT (exemples) :
+ * GET  {url}?token=XXX&action=list
+ * GET  {url}?token=XXX&action=stats
+ * GET  {url}?token=XXX&action=get&id=xxx-xxx
+ * POST {url}  body: { token, action:"add", dossier:{ Nom, Type, Acheteur, Statut, DateLimite, Montant, Notes } }
+ * POST {url}  body: { token, action:"update", id, dossier:{ ...champs à changer } }
+ * POST {url}  body: { token, action:"delete", id }
+ * POST {url}  body: { token, action:"bulkSync", dossiers:[ {...}, {...} ] }
+ */
+
+const SHEET_DOSSIERS = "Dossiers";
+const SHEET_HISTORIQUE = "Historique";
+const COLONNES = ["ID", "Nom", "Type", "Acheteur", "Statut", "DateLimite", "Montant", "Notes", "DateCreation", "DateMAJ"];
+
+function doGet(e) {
+  const authError = checkToken(e.parameter.token || "");
+  if (authError) return authError;
+
+  const action = e.parameter.action || "list";
+
+  if (action === "list") {
+    return jsonOutput(JSON.stringify({ ok: true, dossiers: listDossiers() }));
+  }
+  if (action === "stats") {
+    return jsonOutput(JSON.stringify({ ok: true, stats: getStats() }));
+  }
+  if (action === "get" && e.parameter.id) {
+    const dossier = getDossierById(e.parameter.id);
+    return jsonOutput(JSON.stringify({ ok: !!dossier, dossier: dossier || null }));
+  }
+  return jsonOutput(JSON.stringify({ error: "unknown_action" }));
+}
+
+function doPost(e) {
+  let body;
+  try {
+    body = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return jsonOutput(JSON.stringify({ error: "invalid_json" }));
+  }
+
+  const authError = checkToken(body.token || "");
+  if (authError) return authError;
+
+  const action = body.action || "add";
+
+  if (action === "add") {
+    return jsonOutput(JSON.stringify({ ok: true, dossier: addDossier(body.dossier || {}) }));
+  }
+  if (action === "update") {
+    const updated = updateDossier(body.id, body.dossier || {});
+    return jsonOutput(JSON.stringify({ ok: !!updated, dossier: updated || null }));
+  }
+  if (action === "delete") {
+    return jsonOutput(JSON.stringify({ ok: deleteDossier(body.id) }));
+  }
+  if (action === "bulkSync") {
+    bulkReplace(body.dossiers || []);
+    return jsonOutput(JSON.stringify({ ok: true, count: (body.dossiers || []).length }));
+  }
+  return jsonOutput(JSON.stringify({ error: "unknown_action" }));
+}
+
+/* ---------- CRUD ---------- */
+
+function listDossiers() {
+  const sheet = getSheet(SHEET_DOSSIERS);
+  const data = sheet.getDataRange().getValues();
+  return data.slice(1).filter(r => r[0]).map(rowToObject);
+}
+
+function getDossierById(id) {
+  return listDossiers().find(d => d.ID === id) || null;
+}
+
+function addDossier(champs) {
+  const sheet = getSheet(SHEET_DOSSIERS);
+  const id = Utilities.getUuid();
+  const now = new Date();
+  const row = [
+    id,
+    champs.Nom || "",
+    champs.Type || "AO",
+    champs.Acheteur || "",
+    champs.Statut || "À monter",
+    champs.DateLimite ? new Date(champs.DateLimite) : "",
+    champs.Montant || "",
+    champs.Notes || "",
+    now,
+    now
+  ];
+  sheet.appendRow(row);
+  logHistorique(id, "Création", champs.Nom || "");
+  return rowToObject(row);
+}
+
+function updateDossier(id, champs) {
+  const sheet = getSheet(SHEET_DOSSIERS);
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === id) {
+      const rowNum = i + 1;
+      COLONNES.forEach((col, idx) => {
+        if (champs[col] !== undefined && col !== "ID" && col !== "DateCreation") {
+          const val = (col === "DateLimite" && champs[col]) ? new Date(champs[col]) : champs[col];
+          sheet.getRange(rowNum, idx + 1).setValue(val);
+        }
+      });
+      sheet.getRange(rowNum, COLONNES.indexOf("DateMAJ") + 1).setValue(new Date());
+      logHistorique(id, "Modification", champs.Statut || "");
+      return rowToObject(sheet.getRange(rowNum, 1, 1, COLONNES.length).getValues()[0]);
+    }
+  }
+  return null;
+}
+
+function deleteDossier(id) {
+  const sheet = getSheet(SHEET_DOSSIERS);
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === id) {
+      sheet.deleteRow(i + 1);
+      logHistorique(id, "Suppression", "");
+      return true;
+    }
+  }
+  return false;
+}
+
+function bulkReplace(dossiers) {
+  const sheet = getSheet(SHEET_DOSSIERS);
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, COLONNES.length).clearContent();
+  }
+  dossiers.forEach(addDossierSilent);
+}
+
+function addDossierSilent(champs) {
+  const sheet = getSheet(SHEET_DOSSIERS);
+  const now = new Date();
+  sheet.appendRow([
+    champs.ID || Utilities.getUuid(),
+    champs.Nom || "",
+    champs.Type || "AO",
+    champs.Acheteur || "",
+    champs.Statut || "À monter",
+    champs.DateLimite ? new Date(champs.DateLimite) : "",
+    champs.Montant || "",
+    champs.Notes || "",
+    champs.DateCreation ? new Date(champs.DateCreation) : now,
+    now
+  ]);
+}
+
+/* ---------- Stats ---------- */
+
+function getStats() {
+  const dossiers = listDossiers();
+  const parStatut = {};
+  dossiers.forEach(d => { parStatut[d.Statut] = (parStatut[d.Statut] || 0) + 1; });
+  return { total: dossiers.length, parStatut: parStatut };
+}
+
+/* ---------- Historique ---------- */
+
+function logHistorique(id, action, detail) {
+  getSheet(SHEET_HISTORIQUE).appendRow([new Date(), id, action, detail]);
+}
+
+/* ---------- Rappels d'échéance ---------- */
+// À activer via Triggers > Add trigger > verifierEcheances > Time-driven > Day timer
+
+function verifierEcheances() {
+  const dansTroisJours = new Date();
+  dansTroisJours.setDate(dansTroisJours.getDate() + 3);
+
+  const urgents = listDossiers().filter(d => {
+    if (!d.DateLimite || d.Statut === "Déposé" || d.Statut === "Perdu") return false;
+    return new Date(d.DateLimite) <= dansTroisJours;
+  });
+
+  if (urgents.length > 0) {
+    const corps = urgents.map(d => `- ${d.Nom} (${d.Acheteur}) — échéance ${d.DateLimite}`).join("\n");
+    MailApp.sendEmail(
+      Session.getActiveUser().getEmail(),
+      "Classeur AMD International — échéances proches",
+      "Dossiers à surveiller :\n\n" + corps
+    );
+  }
+}
+
+/* ---------- Utilitaires ---------- */
+
+function getSheet(nom) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(nom);
+  if (!sheet) {
+    sheet = ss.insertSheet(nom);
+    if (nom === SHEET_DOSSIERS) sheet.appendRow(COLONNES);
+    if (nom === SHEET_HISTORIQUE) sheet.appendRow(["Date", "ID", "Action", "Détail"]);
+  }
+  return sheet;
+}
+
+function rowToObject(row) {
+  const obj = {};
+  COLONNES.forEach((col, idx) => { obj[col] = row[idx]; });
+  return obj;
+}
+
+function checkToken(token) {
+  const stored = PropertiesService.getScriptProperties().getProperty("CLASSEUR_TOKEN");
+  if (!stored || token !== stored) {
+    return jsonOutput(JSON.stringify({ error: "unauthorized" }));
+  }
+  return null;
+}
+
+function jsonOutput(text) {
+  return ContentService.createTextOutput(text).setMimeType(ContentService.MimeType.JSON);
+}
