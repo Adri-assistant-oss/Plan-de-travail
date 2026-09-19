@@ -1,13 +1,20 @@
 /**
- * Classeur AMD International — backend de synchronisation Google Sheets v2
+ * Classeur AMD International — backend de synchronisation Google Sheets v3
  *
- * NOUVEAUTÉS vs v1 :
- * - Chaque dossier = une ligne (au lieu d'un seul blob JSON en A1)
- *   -> lisible et filtrable directement dans Google Sheets
- * - CRUD complet : add / update / delete / list / get / stats
- * - Onglet "Historique" : trace chaque création/modification/suppression
- * - Rappels automatiques par email quand une échéance approche
- * - bulkSync : pour resynchroniser tout depuis l'artefact en un coup
+ * NOUVEAUTÉS vs v2 :
+ * - Champs ajoutés : HeureLimite (heure précise de l'échéance) et Commentaire
+ *   (séparé de Notes)
+ * - Fuseau horaire fixe pour tout le classeur (constante FUSEAU_HORAIRE),
+ *   utilisé pour formater les dates et calculer les échéances correctement
+ * - Validation du Statut par liste déroulante sur la feuille
+ * - Champs calculés à l'affichage : JoursRestants et Urgence
+ *   ("urgent" / "proche" / "normal") — jamais stockés, toujours à jour
+ * - Nouvelle action "search" : filtrer par Statut / Acheteur / Type / texte
+ * - Nouvelle action "exportCsv" : export CSV en un appel
+ * - list() trié automatiquement par échéance la plus proche
+ * - Rappels email plus précis (date + heure + fuseau réel), seuil
+ *   configurable via Script Property RAPPEL_JOURS (3 par défaut)
+ * - Gestion d'erreurs globale (try/catch), messages clairs
  *
  * INSTALLATION :
  * 1. Crée un Google Sheet vide (n'importe quel nom).
@@ -16,19 +23,23 @@
  * 4. Menu Project Settings (roue crantée à gauche) > Script Properties
  *    > Add script property : clé = CLASSEUR_TOKEN, valeur = un mot de passe
  *    que tu choisis (garde-le, c'est lui qui protège tes données).
+ *    (Optionnel) Ajoute aussi RAPPEL_JOURS (ex: "3") pour changer le seuil
+ *    de rappel.
  * 5. Menu Deploy > New deployment > type "Web app".
  *    - Execute as: Me
  *    - Who has access: Anyone
  * 6. Copie l'URL générée (se termine par /exec).
  * 7. (Optionnel) Menu Triggers (horloge à gauche) > Add Trigger >
  *    fonction "verifierEcheances" > Time-driven > Day timer
- *    -> pour recevoir un email quand une échéance approche à 3 jours.
+ *    -> pour recevoir un email quand une échéance approche.
  *
  * APPELS DEPUIS L'ARTEFACT (exemples) :
  * GET  {url}?token=XXX&action=list
  * GET  {url}?token=XXX&action=stats
  * GET  {url}?token=XXX&action=get&id=xxx-xxx
- * POST {url}  body: { token, action:"add", dossier:{ Nom, Type, Acheteur, Statut, DateLimite, Montant, Notes } }
+ * GET  {url}?token=XXX&action=search&statut=En+cours&acheteur=UNICEF&texte=eau
+ * GET  {url}?token=XXX&action=exportCsv
+ * POST {url}  body: { token, action:"add", dossier:{ Nom, Type, Acheteur, Statut, DateLimite, HeureLimite, Montant, Notes, Commentaire } }
  * POST {url}  body: { token, action:"update", id, dossier:{ ...champs à changer } }
  * POST {url}  body: { token, action:"delete", id }
  * POST {url}  body: { token, action:"bulkSync", dossiers:[ {...}, {...} ] }
@@ -36,55 +47,76 @@
 
 const SHEET_DOSSIERS = "Dossiers";
 const SHEET_HISTORIQUE = "Historique";
-const COLONNES = ["ID", "Nom", "Type", "Acheteur", "Statut", "DateLimite", "Montant", "Notes", "DateCreation", "DateMAJ"];
+const COLONNES = ["ID", "Nom", "Type", "Acheteur", "Statut", "DateLimite", "HeureLimite", "Montant", "Notes", "Commentaire", "DateCreation", "DateMAJ"];
+const STATUTS_VALIDES = ["À monter", "En cours", "Déposé", "Gagné", "Perdu"];
+const FUSEAU_HORAIRE = "Africa/Ouagadougou"; // fuseau fixe pour tout le classeur (GMT, sans changement d'heure)
+const HEURE_PAR_DEFAUT = "17:00";
 
 function doGet(e) {
-  const authError = checkToken(e.parameter.token || "");
-  if (authError) return authError;
+  try {
+    const authError = checkToken(e.parameter.token || "");
+    if (authError) return authError;
 
-  const action = e.parameter.action || "list";
+    const action = e.parameter.action || "list";
 
-  if (action === "list") {
-    return jsonOutput(JSON.stringify({ ok: true, dossiers: listDossiers() }));
+    if (action === "list") {
+      return jsonOutput(JSON.stringify({ ok: true, dossiers: listDossiersEnrichis() }));
+    }
+    if (action === "stats") {
+      return jsonOutput(JSON.stringify({ ok: true, stats: getStats() }));
+    }
+    if (action === "get" && e.parameter.id) {
+      const dossier = getDossierById(e.parameter.id);
+      return jsonOutput(JSON.stringify({ ok: !!dossier, dossier: dossier ? enrichirDossier(dossier) : null }));
+    }
+    if (action === "search") {
+      return jsonOutput(JSON.stringify({ ok: true, dossiers: searchDossiers(e.parameter) }));
+    }
+    if (action === "exportCsv") {
+      return csvOutput(dossiersToCsv(listDossiersEnrichis()));
+    }
+    return jsonOutput(JSON.stringify({ error: "unknown_action" }));
+  } catch (err) {
+    return jsonOutput(JSON.stringify({ error: "server_error", message: String(err) }));
   }
-  if (action === "stats") {
-    return jsonOutput(JSON.stringify({ ok: true, stats: getStats() }));
-  }
-  if (action === "get" && e.parameter.id) {
-    const dossier = getDossierById(e.parameter.id);
-    return jsonOutput(JSON.stringify({ ok: !!dossier, dossier: dossier || null }));
-  }
-  return jsonOutput(JSON.stringify({ error: "unknown_action" }));
 }
 
 function doPost(e) {
-  let body;
   try {
-    body = JSON.parse(e.postData.contents);
+    let body;
+    try {
+      body = JSON.parse(e.postData.contents);
+    } catch (err) {
+      return jsonOutput(JSON.stringify({ error: "invalid_json" }));
+    }
+
+    const authError = checkToken(body.token || "");
+    if (authError) return authError;
+
+    const action = body.action || "add";
+
+    if (action === "add") {
+      const champs = body.dossier || {};
+      if (!champs.Nom) {
+        return jsonOutput(JSON.stringify({ error: "champ_requis", message: "Le champ Nom est obligatoire." }));
+      }
+      return jsonOutput(JSON.stringify({ ok: true, dossier: enrichirDossier(addDossier(champs)) }));
+    }
+    if (action === "update") {
+      const updated = updateDossier(body.id, body.dossier || {});
+      return jsonOutput(JSON.stringify({ ok: !!updated, dossier: updated ? enrichirDossier(updated) : null }));
+    }
+    if (action === "delete") {
+      return jsonOutput(JSON.stringify({ ok: deleteDossier(body.id) }));
+    }
+    if (action === "bulkSync") {
+      bulkReplace(body.dossiers || []);
+      return jsonOutput(JSON.stringify({ ok: true, count: (body.dossiers || []).length }));
+    }
+    return jsonOutput(JSON.stringify({ error: "unknown_action" }));
   } catch (err) {
-    return jsonOutput(JSON.stringify({ error: "invalid_json" }));
+    return jsonOutput(JSON.stringify({ error: "server_error", message: String(err) }));
   }
-
-  const authError = checkToken(body.token || "");
-  if (authError) return authError;
-
-  const action = body.action || "add";
-
-  if (action === "add") {
-    return jsonOutput(JSON.stringify({ ok: true, dossier: addDossier(body.dossier || {}) }));
-  }
-  if (action === "update") {
-    const updated = updateDossier(body.id, body.dossier || {});
-    return jsonOutput(JSON.stringify({ ok: !!updated, dossier: updated || null }));
-  }
-  if (action === "delete") {
-    return jsonOutput(JSON.stringify({ ok: deleteDossier(body.id) }));
-  }
-  if (action === "bulkSync") {
-    bulkReplace(body.dossiers || []);
-    return jsonOutput(JSON.stringify({ ok: true, count: (body.dossiers || []).length }));
-  }
-  return jsonOutput(JSON.stringify({ error: "unknown_action" }));
 }
 
 /* ---------- CRUD ---------- */
@@ -95,8 +127,34 @@ function listDossiers() {
   return data.slice(1).filter(r => r[0]).map(rowToObject);
 }
 
+function listDossiersEnrichis() {
+  const dossiers = listDossiers().map(enrichirDossier);
+  dossiers.sort((a, b) => {
+    if (!a._dateLimiteComplete) return 1;
+    if (!b._dateLimiteComplete) return -1;
+    return a._dateLimiteComplete - b._dateLimiteComplete;
+  });
+  return dossiers;
+}
+
 function getDossierById(id) {
   return listDossiers().find(d => d.ID === id) || null;
+}
+
+function searchDossiers(params) {
+  let resultats = listDossiersEnrichis();
+  if (params.statut) resultats = resultats.filter(d => d.Statut === params.statut);
+  if (params.acheteur) resultats = resultats.filter(d => (d.Acheteur || "").toLowerCase().includes(params.acheteur.toLowerCase()));
+  if (params.type) resultats = resultats.filter(d => d.Type === params.type);
+  if (params.texte) {
+    const t = params.texte.toLowerCase();
+    resultats = resultats.filter(d =>
+      (d.Nom || "").toLowerCase().includes(t) ||
+      (d.Notes || "").toLowerCase().includes(t) ||
+      (d.Commentaire || "").toLowerCase().includes(t)
+    );
+  }
+  return resultats;
 }
 
 function addDossier(champs) {
@@ -108,10 +166,12 @@ function addDossier(champs) {
     champs.Nom || "",
     champs.Type || "AO",
     champs.Acheteur || "",
-    champs.Statut || "À monter",
+    validerStatut(champs.Statut),
     champs.DateLimite ? new Date(champs.DateLimite) : "",
+    validerHeure(champs.HeureLimite),
     champs.Montant || "",
     champs.Notes || "",
+    champs.Commentaire || "",
     now,
     now
   ];
@@ -128,7 +188,10 @@ function updateDossier(id, champs) {
       const rowNum = i + 1;
       COLONNES.forEach((col, idx) => {
         if (champs[col] !== undefined && col !== "ID" && col !== "DateCreation") {
-          const val = (col === "DateLimite" && champs[col]) ? new Date(champs[col]) : champs[col];
+          let val = champs[col];
+          if (col === "DateLimite" && val) val = new Date(val);
+          if (col === "HeureLimite") val = validerHeure(val);
+          if (col === "Statut") val = validerStatut(val);
           sheet.getRange(rowNum, idx + 1).setValue(val);
         }
       });
@@ -170,22 +233,85 @@ function addDossierSilent(champs) {
     champs.Nom || "",
     champs.Type || "AO",
     champs.Acheteur || "",
-    champs.Statut || "À monter",
+    validerStatut(champs.Statut),
     champs.DateLimite ? new Date(champs.DateLimite) : "",
+    validerHeure(champs.HeureLimite),
     champs.Montant || "",
     champs.Notes || "",
+    champs.Commentaire || "",
     champs.DateCreation ? new Date(champs.DateCreation) : now,
     now
   ]);
 }
 
+/* ---------- Enrichissement (champs calculés, jamais stockés) ---------- */
+
+function enrichirDossier(dossier) {
+  const dateComplete = combinerDateHeure(dossier.DateLimite, dossier.HeureLimite);
+  const enrichi = Object.assign({}, dossier);
+  enrichi.DateLimiteFormatee = dateComplete ? formatDateHeure(dateComplete) : "";
+  enrichi._dateLimiteComplete = dateComplete;
+
+  if (dateComplete && dossier.Statut !== "Déposé" && dossier.Statut !== "Perdu" && dossier.Statut !== "Gagné") {
+    const joursRestants = Math.ceil((dateComplete - new Date()) / (1000 * 60 * 60 * 24));
+    enrichi.JoursRestants = joursRestants;
+    enrichi.Urgence = joursRestants < 0 ? "dépassé" : joursRestants <= 3 ? "urgent" : joursRestants <= 7 ? "proche" : "normal";
+  } else {
+    enrichi.JoursRestants = null;
+    enrichi.Urgence = "n/a";
+  }
+  delete enrichi._dateLimiteComplete; // usage interne au tri uniquement
+  return enrichi;
+}
+
+function combinerDateHeure(dateVal, heureStr) {
+  if (!dateVal) return null;
+  const date = new Date(dateVal);
+  if (isNaN(date.getTime())) return null;
+  const heure = (heureStr && /^\d{1,2}:\d{2}$/.test(heureStr)) ? heureStr : HEURE_PAR_DEFAUT;
+  const [h, m] = heure.split(":").map(Number);
+  const combinee = new Date(date);
+  combinee.setHours(h, m, 0, 0);
+  return combinee;
+}
+
+function formatDateHeure(date) {
+  return Utilities.formatDate(date, FUSEAU_HORAIRE, "dd/MM/yyyy HH:mm") + " (" + FUSEAU_HORAIRE + ")";
+}
+
+function validerStatut(statut) {
+  return STATUTS_VALIDES.includes(statut) ? statut : STATUTS_VALIDES[0];
+}
+
+function validerHeure(heure) {
+  return (heure && /^\d{1,2}:\d{2}$/.test(heure)) ? heure : HEURE_PAR_DEFAUT;
+}
+
 /* ---------- Stats ---------- */
 
 function getStats() {
-  const dossiers = listDossiers();
+  const dossiers = listDossiersEnrichis();
   const parStatut = {};
   dossiers.forEach(d => { parStatut[d.Statut] = (parStatut[d.Statut] || 0) + 1; });
-  return { total: dossiers.length, parStatut: parStatut };
+  const urgents = dossiers.filter(d => d.Urgence === "urgent" || d.Urgence === "dépassé").length;
+  return { total: dossiers.length, parStatut: parStatut, urgents: urgents };
+}
+
+/* ---------- Export CSV ---------- */
+
+function dossiersToCsv(dossiers) {
+  const entetes = COLONNES.concat(["JoursRestants", "Urgence"]);
+  const lignes = [entetes.join(",")];
+  dossiers.forEach(d => {
+    const ligne = entetes.map(col => {
+      let val = d[col];
+      if (val instanceof Date) val = formatDateHeure(val);
+      val = (val === undefined || val === null) ? "" : String(val);
+      return '"' + val.replace(/"/g, '""') + '"';
+    });
+    lignes.push(ligne.join(","));
+  });
+  return lignes.join("\n");
 }
 
 /* ---------- Historique ---------- */
@@ -198,16 +324,17 @@ function logHistorique(id, action, detail) {
 // À activer via Triggers > Add trigger > verifierEcheances > Time-driven > Day timer
 
 function verifierEcheances() {
-  const dansTroisJours = new Date();
-  dansTroisJours.setDate(dansTroisJours.getDate() + 3);
+  const seuilJours = Number(PropertiesService.getScriptProperties().getProperty("RAPPEL_JOURS")) || 3;
 
-  const urgents = listDossiers().filter(d => {
-    if (!d.DateLimite || d.Statut === "Déposé" || d.Statut === "Perdu") return false;
-    return new Date(d.DateLimite) <= dansTroisJours;
+  const urgents = listDossiersEnrichis().filter(d => {
+    if (d.Urgence === "n/a") return false;
+    return d.JoursRestants !== null && d.JoursRestants <= seuilJours;
   });
 
   if (urgents.length > 0) {
-    const corps = urgents.map(d => `- ${d.Nom} (${d.Acheteur}) — échéance ${d.DateLimite}`).join("\n");
+    const corps = urgents.map(d =>
+      `- ${d.Nom} (${d.Acheteur}) — échéance ${d.DateLimiteFormatee} — ${d.JoursRestants < 0 ? "DÉPASSÉE" : d.JoursRestants + " jour(s) restant(s)"}`
+    ).join("\n");
     MailApp.sendEmail(
       Session.getActiveUser().getEmail(),
       "Classeur AMD International — échéances proches",
@@ -223,7 +350,12 @@ function getSheet(nom) {
   let sheet = ss.getSheetByName(nom);
   if (!sheet) {
     sheet = ss.insertSheet(nom);
-    if (nom === SHEET_DOSSIERS) sheet.appendRow(COLONNES);
+    if (nom === SHEET_DOSSIERS) {
+      sheet.appendRow(COLONNES);
+      const colStatut = COLONNES.indexOf("Statut") + 1;
+      const regle = SpreadsheetApp.newDataValidation().requireValueInList(STATUTS_VALIDES, true).build();
+      sheet.getRange(2, colStatut, 500, 1).setDataValidation(regle);
+    }
     if (nom === SHEET_HISTORIQUE) sheet.appendRow(["Date", "ID", "Action", "Détail"]);
   }
   return sheet;
@@ -245,4 +377,8 @@ function checkToken(token) {
 
 function jsonOutput(text) {
   return ContentService.createTextOutput(text).setMimeType(ContentService.MimeType.JSON);
+}
+
+function csvOutput(text) {
+  return ContentService.createTextOutput(text).setMimeType(ContentService.MimeType.CSV);
 }
